@@ -10,23 +10,29 @@ from database import markAttendanceMySQL, fetch_attendance_by_date, delete_atten
 class SmartAttendanceApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Smart Attendance System ")
+        self.root.title("Smart Attendance System")
         self.root.geometry("950x650")
         self.root.configure(bg="#f0f0f0")
 
+        # Data
         self.images = []
         self.studentNames = []
         self.encodeListKnown = []
         self.path = ""
+
+        # Camera / threading
         self.running = False
-        self.camera_thread = None  # ✅ store camera thread
-        self.stop_event = threading.Event()  # ✅ safer thread stop signal
+        self.camera_thread = None
+        self.stop_event = threading.Event()
+
+        # Toast window handle
+        self._toast_win = None
 
         self.create_widgets()
 
     # --------------------- GUI Setup ---------------------
     def create_widgets(self):
-        title = Label(self.root, text="Smart Attendance System ",
+        title = Label(self.root, text="Smart Attendance System",
                       font=("Arial", 22, "bold"), bg="#283593", fg="white", pady=10)
         title.pack(fill=X)
 
@@ -54,7 +60,7 @@ class SmartAttendanceApp:
         Button(frame, text="🗑️ Delete Selected Attendance", command=self.delete_selected_attendance,
                font=("Arial", 12), bg="#f57c00", fg="white", width=25).grid(row=3, column=0, padx=10, pady=10)
 
-        Button(frame, text="❌ Exit", command=self.root.quit,
+        Button(frame, text="❌ Exit", command=self.on_exit,
                font=("Arial", 12), bg="#e53935", fg="white", width=25).grid(row=3, column=1, padx=10, pady=10)
 
         self.status_label = Label(self.root, text="Status: Ready", font=("Arial", 12), bg="#f0f0f0", fg="black")
@@ -109,66 +115,158 @@ class SmartAttendanceApp:
         self.running = False
         self.stop_event.set()
         self.status_label.config(text="Camera stopping...")
-        messagebox.showinfo("Stopped", "Camera stopped successfully!")
+        # don't block main thread here; camera will stop itself
+        # show a toast that stop was requested
+        self._show_toast("Stopping camera...", duration=1200)
+
+    # --------------------- Safe app exit ---------------------
+    def on_exit(self):
+        # stop camera if running
+        if self.running:
+            self.stop_event.set()
+        # give camera thread time to stop gracefully
+        if self.camera_thread and self.camera_thread.is_alive():
+            # Join with timeout to avoid blocking indefinitely
+            self.camera_thread.join(timeout=1.0)
+        self.root.quit()
+
+    # --------------------- Toast helper ---------------------
+    def _show_toast(self, message, duration=1500):
+        """
+        Show a small non-blocking toast message for `duration` milliseconds.
+        Only one toast is shown at a time; new toasts replace the current one.
+        This must be called from the main thread; when calling from camera thread, use self.root.after(0, ...).
+        """
+        # Destroy existing toast if present
+        try:
+            if hasattr(self, "_toast_win") and self._toast_win is not None:
+                try:
+                    self._toast_win.destroy()
+                except Exception:
+                    pass
+                self._toast_win = None
+        except Exception:
+            self._toast_win = None
+
+        # Create new toast window
+        self._toast_win = Toplevel(self.root)
+        self._toast_win.overrideredirect(True)  # no decorations
+        try:
+            # On some platforms this raises; protect it
+            self._toast_win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        label = Label(self._toast_win, text=message, bg="#333", fg="white",
+                      font=("Arial", 11), padx=10, pady=6)
+        label.pack()
+
+        # Position toast at bottom-right of main window
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+
+        tw = self._toast_win.winfo_reqwidth()
+        th = self._toast_win.winfo_reqheight()
+
+        x = rx + rw - tw - 20
+        y = ry + rh - th - 20
+        self._toast_win.geometry(f"+{x}+{y}")
+
+        # Auto destroy after duration ms
+        def _destroy_toast():
+            try:
+                if self._toast_win is not None:
+                    self._toast_win.destroy()
+            finally:
+                self._toast_win = None
+
+        self._toast_win.after(duration, _destroy_toast)
 
     # --------------------- Run Camera Thread ---------------------
     def run_camera(self):
-        import face_recognition
+        """
+        Camera loop runs in a background thread. All tkinter UI updates must be scheduled
+        through self.root.after(...) to run on the main thread.
+        """
+        import face_recognition  # keep import local to avoid startup costs if not used
         cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            # schedule an error message on the main thread
+            self.root.after(0, lambda: messagebox.showerror("Camera Error", "Unable to open camera."))
+            self.root.after(0, lambda: self.status_label.config(text="Camera error."))
+            self.running = False
+            return
+
         THRESHOLD = 0.5
         marked_today = set()
 
-        while not self.stop_event.is_set():
-            success, img = cap.read()
-            if not success:
-                break
+        try:
+            while not self.stop_event.is_set():
+                success, img = cap.read()
+                if not success:
+                    break
 
-            imgS = cv2.resize(img, (0, 0), fx=0.25, fy=0.25)
-            imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
+                # Process smaller image for speed
+                imgS = cv2.resize(img, (0, 0), fx=0.25, fy=0.25)
+                imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
 
-            facesCurFrame = face_recognition.face_locations(imgS)
-            encodesCurFrame = face_recognition.face_encodings(imgS, facesCurFrame)
+                facesCurFrame = face_recognition.face_locations(imgS)
+                encodesCurFrame = face_recognition.face_encodings(imgS, facesCurFrame)
 
-            for encodeFace, faceLoc in zip(encodesCurFrame, facesCurFrame):
-                faceDis = face_recognition.face_distance(self.encodeListKnown, encodeFace)
-                matches = face_recognition.compare_faces(self.encodeListKnown, encodeFace)
-                matchIndex = np.argmin(faceDis)
+                for encodeFace, faceLoc in zip(encodesCurFrame, facesCurFrame):
+                    if not self.encodeListKnown:
+                        continue
+                    faceDis = face_recognition.face_distance(self.encodeListKnown, encodeFace)
+                    matches = face_recognition.compare_faces(self.encodeListKnown, encodeFace)
+                    matchIndex = np.argmin(faceDis)
 
-                if matches[matchIndex] and faceDis[matchIndex] < THRESHOLD:
-                    name = self.studentNames[matchIndex].upper()
-                    if name not in marked_today:
-                        # mark attendance in DB
-                        markAttendanceMySQL(name)
-                        marked_today.add(name)
+                    if matches[matchIndex] and faceDis[matchIndex] < THRESHOLD:
+                        name = self.studentNames[matchIndex].upper()
+                        if name not in marked_today:
+                            try:
+                                markAttendanceMySQL(name)
+                            except Exception as e:
+                                # Log DB error and inform user once
+                                self.root.after(0, lambda err=str(e): messagebox.showerror("DB Error", f"Failed to mark attendance: {err}"))
+                            else:
+                                marked_today.add(name)
+                                # Update status label (on main thread)
+                                self.root.after(0, lambda n=name: self.status_label.config(text=f"Attendance marked for {n}"))
+                                # Show a non-blocking toast (on main thread). This avoids blocking multiple message boxes.
+                                self.root.after(0, lambda n=name: self._show_toast(f"Attendance marked for {n}", duration=1500))
 
-                        # Update status label from main thread
-                        self.root.after(0, lambda n=name: self.status_label.config(text=f"Attendance marked for {n}"))
+                        # Draw rectangles and name on the image (for preview window)
+                        y1, x2, y2, x1 = faceLoc
+                        y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.rectangle(img, (x1, y2 - 35), (x2, y2), (0, 255, 0), cv2.FILLED)
+                        cv2.putText(img, name, (x1 + 6, y2 - 6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-                        # Show a message box informing attendance done (must be called from main thread)
-                        self.root.after(0, lambda n=name: messagebox.showinfo("Attendance Done", f"Attendance marked for {n}"))
-
-                    y1, x2, y2, x1 = faceLoc
-                    y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.rectangle(img, (x1, y2 - 35), (x2, y2), (0, 255, 0), cv2.FILLED)
-                    cv2.putText(img, name, (x1 + 6, y2 - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-            cv2.imshow("Attendance System - Press 'q' to close", img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                self.stop_event.set()
-                break
-
-        cap.release()
-        cv2.destroyAllWindows()
-        self.running = False
-        # Ensure UI updates happen on main thread
-        self.root.after(0, lambda: self.status_label.config(text="Camera stopped."))
+                # Show preview window. This is fine from a background thread for OpenCV windows.
+                cv2.imshow("Attendance System - Press 'q' to close", img)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    # User requested to stop via preview window
+                    self.stop_event.set()
+                    break
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            self.running = False
+            # Ensure UI update happens on main thread
+            self.root.after(0, lambda: self.status_label.config(text="Camera stopped."))
 
     # --------------------- Show Today’s Attendance ---------------------
     def show_today_attendance(self):
         today = datetime.now().date()
-        rows = fetch_attendance_by_date(today)
+        try:
+            rows = fetch_attendance_by_date(today)
+        except Exception as e:
+            messagebox.showerror("DB Error", f"Failed to fetch attendance: {e}")
+            return
         self.tree.delete(*self.tree.get_children())
         for r in rows:
             self.tree.insert("", END, values=r)
@@ -185,7 +283,11 @@ class SmartAttendanceApp:
 
         def search():
             date_val = entry.get()
-            rows = fetch_attendance_by_date(date_val)
+            try:
+                rows = fetch_attendance_by_date(date_val)
+            except Exception as e:
+                messagebox.showerror("DB Error", f"Failed to fetch attendance: {e}")
+                return
             self.tree.delete(*self.tree.get_children())
             for r in rows:
                 self.tree.insert("", END, values=r)
@@ -203,14 +305,22 @@ class SmartAttendanceApp:
 
         for item in selected:
             values = self.tree.item(item, "values")
-            name, date, time = values
-            delete_attendance_record(name, date, time)
+            # Expecting (Name, Date, Time)
+            try:
+                name, date, time = values
+            except ValueError:
+                continue
+            try:
+                delete_attendance_record(name, date, time)
+            except Exception as e:
+                messagebox.showerror("DB Error", f"Failed to delete record: {e}")
+                continue
             self.tree.delete(item)
 
         messagebox.showinfo("Deleted", "Selected attendance record(s) deleted successfully!")
         self.status_label.config(text="Selected record(s) deleted.")
 
-
+# --------------------- Run App ---------------------
 if __name__ == "__main__":
     root = Tk()
     app = SmartAttendanceApp(root)
