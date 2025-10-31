@@ -137,8 +137,15 @@ class SmartAttendanceApp:
                 if matches[matchIndex] and faceDis[matchIndex] < THRESHOLD:
                     name = self.studentNames[matchIndex].upper()
                     if name not in marked_today:
+                        # mark attendance in DB
                         markAttendanceMySQL(name)
                         marked_today.add(name)
+
+                        # Update status label from main thread
+                        self.root.after(0, lambda n=name: self.status_label.config(text=f"Attendance marked for {n}"))
+
+                        # Show a message box informing attendance done (must be called from main thread)
+                        self.root.after(0, lambda n=name: messagebox.showinfo("Attendance Done", f"Attendance marked for {n}"))
 
                     y1, x2, y2, x1 = faceLoc
                     y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
@@ -155,7 +162,8 @@ class SmartAttendanceApp:
         cap.release()
         cv2.destroyAllWindows()
         self.running = False
-        self.status_label.config(text="Camera stopped.")
+        # Ensure UI updates happen on main thread
+        self.root.after(0, lambda: self.status_label.config(text="Camera stopped."))
 
     # --------------------- Show Today’s Attendance ---------------------
     def show_today_attendance(self):
@@ -202,7 +210,7 @@ class SmartAttendanceApp:
         messagebox.showinfo("Deleted", "Selected attendance record(s) deleted successfully!")
         self.status_label.config(text="Selected record(s) deleted.")
 
-# --------------------- Run App ---------------------
+
 if __name__ == "__main__":
     root = Tk()
     app = SmartAttendanceApp(root)
